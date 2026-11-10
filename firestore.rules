@@ -1,0 +1,97 @@
+rules_version = '2';
+
+// Paste this whole file into: Firebase console -> Firestore Database -> Rules -> Publish.
+// CHANGE the organizer e-mail below (same address(es) as ADMIN_EMAILS in config.js).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    // Organizer = a Google account whose e-mail is verified and listed here.
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email in ['toxirmaliksaloxiddinov@gmail.com'];
+    }
+
+    function cfg() { return get(/databases/$(database)/documents/config/event).data; }
+
+    // Event state + published leaderboard: everyone signed in may read, only the organizer writes.
+    match /config/{docId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Typing texts: a student can only read the texts of the round that is OPEN right now.
+    match /texts/{docId} {
+      allow read: if isAdmin()
+        || (signedIn() && cfg().open == true && docId == 'r' + string(cfg().round));
+      allow write: if isAdmin();
+    }
+
+    match /players/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'lastLogin'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 60;
+      allow delete: if isAdmin();
+    }
+
+    // One document per attempt, id = <uid>_r<round>_a<attempt>.
+    //  - created when the student presses the first key (status "started"; the server stamps the time)
+    //  - updated once with the result, only within (round seconds + 30 s) after the start
+    //  - never editable afterwards (only the organizer can delete an attempt to give a redo)
+    match /attempts/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'round', 'attempt', 'status', 'startedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'started'
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && request.resource.data.round is int
+        && request.resource.data.attempt is int
+        && id == request.auth.uid + '_r' + string(request.resource.data.round) + '_a' + string(request.resource.data.attempt)
+        && cfg().open == true
+        && request.resource.data.round == cfg().round
+        && request.resource.data.attempt >= 1
+        && request.resource.data.attempt <= cfg().maxAttempts
+        && !exists(/databases/$(database)/documents/finishes/$(request.auth.uid + '_r' + string(request.resource.data.round)))
+        && (request.resource.data.attempt == 1
+            || exists(/databases/$(database)/documents/attempts/$(request.auth.uid + '_r' + string(request.resource.data.round) + '_a' + string(request.resource.data.attempt - 1))));
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'started'
+        && request.resource.data.status == 'done'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'wpm', 'accuracy', 'correct', 'typed', 'seconds', 'finishedAt'])
+        && request.resource.data.wpm is number && request.resource.data.wpm >= 0 && request.resource.data.wpm <= 300
+        && request.resource.data.accuracy is number && request.resource.data.accuracy >= 0 && request.resource.data.accuracy <= 100
+        && request.resource.data.correct is int && request.resource.data.typed is int
+        && request.resource.data.correct >= 0 && request.resource.data.correct <= request.resource.data.typed
+        && request.resource.data.seconds is number
+        && request.resource.data.seconds <= cfg().durations[string(resource.data.round)] + 1
+        && request.resource.data.finishedAt == request.time
+        && request.time <= resource.data.startedAt + duration.value(cfg().durations[string(resource.data.round)] + 30, 's');
+
+      allow delete: if isAdmin();
+    }
+
+    // "Finish round early" marker: id = <uid>_r<round>, created once.
+    match /finishes/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid', 'round', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.round is int
+        && request.resource.data.createdAt == request.time
+        && id == request.auth.uid + '_r' + string(request.resource.data.round)
+        && exists(/databases/$(database)/documents/attempts/$(request.auth.uid + '_r' + string(request.resource.data.round) + '_a1'));
+      allow delete: if isAdmin();
+    }
+  }
+}
